@@ -1,0 +1,329 @@
+name: Build Lab IPA
+
+# ===========================================================================
+#  这个 workflow 会自动解开仓库里的源码压缩包，然后编译。
+#
+#  用法：
+#    1. 把本文件放到仓库的 .github/workflows/ 目录下
+#    2. 把 Lab-1.0.0-source.zip 上传到仓库根目录（就一个文件，直接拖）
+#    3. Actions 自动跑：解压 → 校验 → 编译 → 产出 IPA
+#
+#  产物：Lab.ipa，在 Actions 页面底部的 Artifacts 里下载
+# ===========================================================================
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: '构建配置'
+        required: true
+        default: 'Release'
+        type: choice
+        options:
+          - Release
+          - Debug
+      ldid_sign:
+        description: '用 ldid 注入私有 entitlements（TrollStore 安装时保持 true）'
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  APPLICATION_NAME: Lab
+  ENTITLEMENTS: Config/Lab.entitlements
+  # 找压缩包用的通配符。仓库里只有一个 zip 时不用改。
+  SOURCE_ZIP_GLOB: '*.zip'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 第一步：解压 + 校验。在 ubuntu 上跑，几秒出结果。
+  # -------------------------------------------------------------------------
+  prepare:
+    name: 解压并校验源码
+    runs-on: ubuntu-latest
+    outputs:
+      app_dir: ${{ steps.extract.outputs.app_dir }}
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 找到并解压源码包
+        id: extract
+        run: |
+          set -eu
+
+          echo "=== 仓库根目录 ==="
+          ls -la
+
+          # 找压缩包。排除掉解压产物，避免重复解压自己。
+          ZIP=$(ls $SOURCE_ZIP_GLOB 2>/dev/null | grep -v -i '^Payload' | head -1 || true)
+
+          if [ -z "$ZIP" ]; then
+            echo "::error::仓库根目录下没有找到 .zip 源码包"
+            echo "请把 Lab-1.0.0-source.zip 上传到仓库根目录（不要放进子文件夹）"
+            exit 1
+          fi
+
+          echo "找到源码包：$ZIP（$(du -h "$ZIP" | cut -f1)）"
+
+          # 解压到临时目录
+          rm -rf _src
+          mkdir -p _src
+          unzip -q "$ZIP" -d _src
+
+          echo
+          echo "=== 解压结果 ==="
+          ls -la _src
+
+          # 定位真正的工程根目录。
+          # 压缩包顶层可能是：
+          #   a) Lab/            —— 我们的包就是这样
+          #   b) lara-main/      —— 原始 lara 包
+          #   c) 直接铺开         —— 没有顶层目录
+          APP_DIR=""
+
+          if [ -f "_src/Lab/Lab.xcodeproj/project.pbxproj" ]; then
+            APP_DIR="_src/Lab"
+          else
+            # 在其他一级子目录里找带 .xcodeproj 的那个
+            for candidate in _src/*/; do
+              if ls "$candidate"*.xcodeproj >/dev/null 2>&1; then
+                APP_DIR="${candidate%/}"
+                break
+              fi
+            done
+          fi
+
+          # 再兜底一次：直接铺在根上的情况
+          if [ -z "$APP_DIR" ] && ls _src/*.xcodeproj >/dev/null 2>&1; then
+            APP_DIR="_src"
+          fi
+
+          if [ -z "$APP_DIR" ]; then
+            echo "::error::解压后没有找到 .xcodeproj，源码包可能不完整"
+            find _src -maxdepth 3 -type d | head -40
+            exit 1
+          fi
+
+          echo
+          echo "工程根目录：$APP_DIR"
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: 上传解压后的源码
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-source
+          path: _src
+          retention-days: 1
+
+      - name: 工程结构自检
+        run: |
+          set -eu
+          cd "${{ steps.extract.outputs.app_dir }}"
+
+          if [ -d Checks ]; then
+            python3 Checks/preflight.py
+            python3 Checks/validate_structure.py
+            python3 Checks/test_bridging_header.py
+            python3 Checks/test_build_workflow.py
+          else
+            echo "::warning::源码包里没有 Checks/ 目录，跳过结构自检"
+          fi
+
+  # -------------------------------------------------------------------------
+  # 第二步：编译
+  # -------------------------------------------------------------------------
+  build:
+    name: 编译并打包 IPA
+    needs: prepare
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 下载解压后的源码
+        uses: actions/download-artifact@v4
+        with:
+          name: extracted-source
+          path: _src
+
+      - name: 定位工程根目录
+        id: locate
+        run: |
+          set -eu
+
+          APP_DIR=""
+          if [ -f "_src/Lab/Lab.xcodeproj/project.pbxproj" ]; then
+            APP_DIR="_src/Lab"
+          else
+            for candidate in _src/*/; do
+              if ls "$candidate"*.xcodeproj >/dev/null 2>&1; then
+                APP_DIR="${candidate%/}"
+                break
+              fi
+            done
+          fi
+          if [ -z "$APP_DIR" ] && ls _src/*.xcodeproj >/dev/null 2>&1; then
+            APP_DIR="_src"
+          fi
+
+          if [ -z "$APP_DIR" ]; then
+            echo "::error::找不到工程根目录"
+            find _src -maxdepth 3 -type d | head -40
+            exit 1
+          fi
+
+          echo "app_dir=$APP_DIR" >> "$GITHUB_OUTPUT"
+          echo "工程根目录：$APP_DIR"
+          ls -la "$APP_DIR" | head -20
+
+      - name: 选择 Xcode
+        run: |
+          # 工程使用 objectVersion = 77，需要 Xcode 16+
+          BEST=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$BEST" ]; then
+            echo "使用 $BEST"
+            sudo xcode-select -s "$BEST/Contents/Developer"
+          else
+            echo "::warning::未找到 Xcode 16，使用 runner 默认版本"
+          fi
+
+          xcodebuild -version
+
+          MAJOR=$(xcodebuild -version | head -1 | sed -E 's/Xcode ([0-9]+).*/\1/')
+          if [ "$MAJOR" -lt 16 ]; then
+            echo "::error::Xcode $MAJOR 低于 16，无法打开 objectVersion 77 的工程"
+            exit 1
+          fi
+
+      - name: 安装 ldid
+        run: brew install ldid
+
+      - name: 解析构建参数
+        id: params
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CONFIG="${{ inputs.configuration }}"
+            LDID="${{ inputs.ldid_sign }}"
+          else
+            CONFIG="Release"
+            LDID="true"
+          fi
+          echo "configuration=$CONFIG" >> "$GITHUB_OUTPUT"
+          echo "ldid=$LDID" >> "$GITHUB_OUTPUT"
+          echo "构建配置：$CONFIG，ldid 伪签名：$LDID"
+
+      - name: 编译
+        run: |
+          set -o pipefail
+          cd "${{ steps.locate.outputs.app_dir }}"
+
+          mkdir -p build
+
+          xcodebuild \
+            -project "$APPLICATION_NAME.xcodeproj" \
+            -scheme "$APPLICATION_NAME" \
+            -configuration "${{ steps.params.outputs.configuration }}" \
+            -sdk iphoneos \
+            -arch arm64e \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS="$ENTITLEMENTS" \
+            archive \
+            -archivePath "$PWD/build/$APPLICATION_NAME.xcarchive" \
+            -derivedDataPath "$PWD/build/DerivedData" \
+            2>&1 | tee build/xcodebuild.log || {
+              echo "::error::编译失败，末尾 80 行日志如下"
+              tail -80 build/xcodebuild.log
+              exit 1
+            }
+
+      - name: 打包 IPA 并注入 entitlements
+        run: |
+          set -eu
+          cd "${{ steps.locate.outputs.app_dir }}"
+
+          APP_PATH="$PWD/build/$APPLICATION_NAME.xcarchive/Products/Applications/$APPLICATION_NAME.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "::error::归档中未找到 $APPLICATION_NAME.app"
+            find "$PWD/build" -maxdepth 4 -type d | head -40
+            exit 1
+          fi
+
+          rm -rf "$PWD/build/Payload"
+          mkdir -p "$PWD/build/Payload"
+          cp -R "$APP_PATH" "$PWD/build/Payload/"
+
+          plutil -replace UIFileSharingEnabled -bool YES \
+            "$PWD/build/Payload/$APPLICATION_NAME.app/Info.plist" || true
+
+          BIN="$PWD/build/Payload/$APPLICATION_NAME.app/$APPLICATION_NAME"
+
+          if [ "${{ steps.params.outputs.ldid }}" = "true" ]; then
+            echo "=== 用 ldid 注入私有 entitlements ==="
+            ldid -S"$ENTITLEMENTS" "$BIN"
+
+            echo "=== 注入结果 ==="
+            ldid -e "$BIN" | head -30
+
+            echo
+            echo "================================================================"
+            echo " 产物带私有 entitlements，只能用 TrollStore 类安装器安装。"
+            echo " 普通开发者证书重签会剥离这些权限，导致内核功能不可用。"
+            echo "================================================================"
+          else
+            echo "=== 已跳过 ldid 注入 ==="
+            echo "产出为纯净未签名包，内核功能将不可用（应用会自动检测并隐藏相关界面）"
+          fi
+
+          (cd "$PWD/build" && /usr/bin/zip -qry "$APPLICATION_NAME.ipa" Payload)
+
+          echo
+          echo "IPA 大小：$(du -h "$PWD/build/$APPLICATION_NAME.ipa" | cut -f1)"
+
+      - name: 校验 IPA 结构
+        run: |
+          set -eu
+          cd "${{ steps.locate.outputs.app_dir }}/build"
+
+          echo "=== Payload 顶层 ==="
+          unzip -l "$APPLICATION_NAME.ipa" | head -20
+
+          echo
+          echo "=== 可执行文件架构 ==="
+          rm -rf /tmp/ipa_check
+          unzip -o -q "$APPLICATION_NAME.ipa" \
+            "Payload/$APPLICATION_NAME.app/$APPLICATION_NAME" -d /tmp/ipa_check
+          lipo -info "/tmp/ipa_check/Payload/$APPLICATION_NAME.app/$APPLICATION_NAME" || true
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lab-ipa
+          path: ${{ steps.locate.outputs.app_dir }}/build/Lab.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传构建日志（失败时排查用）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ steps.locate.outputs.app_dir }}/build/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
