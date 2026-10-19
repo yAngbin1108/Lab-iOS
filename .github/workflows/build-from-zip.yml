@@ -125,6 +125,11 @@ jobs:
         with:
           name: extracted-source
           path: _src
+          # include-hidden-files 必须为 true。
+          # upload-artifact 默认**跳过点开头的文件/目录**，
+          # 而工程里的 .github/ 会被丢掉 —— 编译本身不受影响，
+          # 但下一个 job 拿到的源码就不完整了，后续排查会很困惑。
+          include-hidden-files: true
           retention-days: 1
 
       - name: 工程结构自检
@@ -238,7 +243,6 @@ jobs:
             -scheme "$APPLICATION_NAME" \
             -configuration "${{ steps.params.outputs.configuration }}" \
             -sdk iphoneos \
-            -arch arm64e \
             -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
