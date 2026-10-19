@@ -152,7 +152,7 @@ jobs:
   build:
     name: 编译并打包 IPA
     needs: prepare
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
 
     steps:
@@ -196,23 +196,63 @@ jobs:
           ls -la "$APP_DIR" | head -20
 
       - name: 选择 Xcode
+        id: xcode
         run: |
-          # 工程使用 objectVersion = 77，需要 Xcode 16+
-          BEST=$(ls -d /Applications/Xcode_16*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$BEST" ]; then
-            echo "使用 $BEST"
-            sudo xcode-select -s "$BEST/Contents/Developer"
-          else
-            echo "::warning::未找到 Xcode 16，使用 runner 默认版本"
+          set -eu
+
+          # 关键：PartyUI 用到了 .glassEffect(...) —— 这是 iOS 26 SDK 才有的 API。
+          # 虽然源码里用 if #available(iOS 19.0, *) 做了保护，但**旧 SDK 里连
+          # 这个符号都不存在**，编译器在解析阶段就会报
+          #   value of type 'some View' has no member 'glassEffect'
+          # 所以必须用带 iOS 26 SDK 的 Xcode，否则整个工程编不过。
+          #
+          # 同理，-destination/-arch 二选一的规则之前踩过，这里不再传 -arch。
+
+          echo "=== runner 上可用的 Xcode ==="
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+
+          CHOSEN=""
+          # 优先挑版本号最大的 Xcode
+          for candidate in $(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V -r); do
+            MAJOR=$(echo "$candidate" | sed -E 's|.*/Xcode_([0-9]+).*|\1|')
+            if [ "$MAJOR" -ge 26 ] 2>/dev/null; then
+              CHOSEN="$candidate"
+              break
+            fi
+            # 记下最大的那个当备选
+            if [ -z "$CHOSEN" ]; then CHOSEN="$candidate"; fi
+          done
+
+          if [ -z "$CHOSEN" ] && [ -d /Applications/Xcode.app ]; then
+            CHOSEN=/Applications/Xcode.app
           fi
 
-          xcodebuild -version
-
-          MAJOR=$(xcodebuild -version | head -1 | sed -E 's/Xcode ([0-9]+).*/\1/')
-          if [ "$MAJOR" -lt 16 ]; then
-            echo "::error::Xcode $MAJOR 低于 16，无法打开 objectVersion 77 的工程"
+          if [ -z "$CHOSEN" ]; then
+            echo "::error::runner 上没有找到任何 Xcode"
             exit 1
           fi
+
+          echo "选用：$CHOSEN"
+          sudo xcode-select -s "$CHOSEN/Contents/Developer"
+          xcodebuild -version
+
+          echo
+          echo "=== 可用 SDK ==="
+          xcodebuild -showsdks | grep -i ios || true
+
+          # 检查 SDK 版本，太老会编不过 PartyUI
+          SDK_VER=$(xcodebuild -showsdks | grep -oE 'iphoneos[0-9]+\.[0-9]+' | head -1 | sed 's/iphoneos//')
+          echo "iOS SDK 版本：$SDK_VER"
+
+          MAJOR_SDK=$(echo "$SDK_VER" | cut -d. -f1)
+          if [ -n "$MAJOR_SDK" ] && [ "$MAJOR_SDK" -lt 26 ]; then
+            echo "::error::当前 SDK 是 iOS $SDK_VER，低于 26。"
+            echo "PartyUI 使用了 .glassEffect(...)，该 API 需要 iOS 26 SDK 才能编译。"
+            echo "请改用带 Xcode 26 的 runner（例如 runs-on: macos-26）。"
+            exit 1
+          fi
+
+          echo "app_dir_ok=1" >> "$GITHUB_OUTPUT"
 
       - name: 安装 ldid
         run: brew install ldid
